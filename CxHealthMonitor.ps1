@@ -842,6 +842,7 @@ Class RESTClient {
     [RESTBody] $restBody
 
     hidden [String] $token
+    hidden [String] $enginetoken
     hidden [IO] $io = [IO]::new()
 
     # Constructs a RESTClient based on given base URL and body
@@ -898,6 +899,39 @@ Class RESTClient {
         return $isLoginSuccessful
     }  
 
+     <#
+    # Logins to the CxSAST REST API
+    # and returns an API token
+    #>
+    [bool] engineLogin ([String] $username, [String] $password) {
+        [bool] $isLoginSuccessful = $False
+        $body = @{
+            username      = $username
+            password      = $password
+            grant_type    = "password"
+            scope         = "engine_api"
+            client_id     = "resource_owner_sast_client"
+            client_secret = "014DF517-39D1-4453-B7B3-9930C563627C"
+        }
+        
+        [psobject] $response = $null
+        try {
+            $loginUrl = $this.baseUrl + "/auth/identity/connect/token"
+            $response = Invoke-RestMethod -uri $loginUrl -method POST -body $body -contenttype 'application/x-www-form-urlencoded' -TimeoutSec $script:config.monitor.apiResponseTimeoutSeconds
+        } catch {
+            $this.io.Log("Could not authenticate against Checkmarx Engine REST API. Reason: HTTP [$($_.Exception.Response.StatusCode.value__)] - $($_.Exception.Response.StatusDescription).")
+        }
+    
+        if ($response -and $response.access_token) {
+            $isLoginSuccessful = $True
+            # Track token internally
+            $this.enginetoken = $response.token_type + " " + $response.access_token
+        }
+
+        
+        return $isLoginSuccessful
+    }  
+
     <#
     # Invokes a given REST API
     #>
@@ -944,6 +978,54 @@ Class RESTClient {
 
         return $response
     }     
+
+    <#
+    # Invokes a given Engine REST API
+    #>
+    [Object] invokeEngineAPI ([String] $requestUri, [RESTMethod] $method, [Object] $body, [int] $apiResponseTimeoutSeconds) { 
+
+        # Sanity : If not logged in, do not proceed
+        if ( ! $this.token) {
+            throw "Must execute login() first, prior to other API calls."
+        }
+
+        $headers = @{
+            "Authorization" = $this.enginetoken
+            "Accept"        = "application/json"
+        }
+
+        $response = $null
+        
+        try {
+            $uri = $requestUri
+            if ($method -ieq "GET") {
+                $response = Invoke-RestMethod -Uri $uri -Method $method -Headers $headers -TimeoutSec $apiResponseTimeoutSeconds
+            }
+            else {
+                $response = Invoke-RestMethod -Uri $uri -Method $method.ToString() -Headers $headers -Body $body -TimeoutSec $apiResponseTimeoutSeconds
+            }
+        
+            Write-Debug "Engine uri: $($uri)"
+            Write-Debug "Engine CxVersion: $($response.cxVersion)"         
+            Write-Debug "Engine lastMQConnectionDateTimeUTC: $($response.lastMQConnectionDateTimeUTC)"         
+
+        }
+        catch {
+            $exception = $_.Exception
+    
+            $this.io.Log("REST API call failed : [$($exception.Message)]")
+            $this.io.Log("Status Code: $($exception.Response.StatusCode)")
+
+            if ($exception.Response.StatusCode -eq "BadRequest") {
+                $respstream = $exception.Response.GetResponseStream()
+                $sr = new-object System.IO.StreamReader $respstream
+                $ErrorResult = $sr.ReadToEnd()
+                $this.io.Log($ErrorResult)
+            }
+        } 
+
+        return $response
+    }
 }
 
 
@@ -1015,6 +1097,7 @@ Class EngineMonitor {
         $this.cxVersion = $this.cxSastRestClient.version()
         # Login to the CxSAST server
         [bool] $isLoginOk = $this.cxSastRestClient.login($script:cxUsername, $script:cxPassword)
+        [bool] $isEngineLoginOK = $this.cxSastRestClient.engineLogin($script:cxUsername, $script:cxPassword)
 
         if ($isLoginOk -eq $True) {
             # Fetch Queue Status
@@ -1037,8 +1120,9 @@ Class EngineMonitor {
         [Object] $resp = $null
         for ($i = 0; $i -lt $script:config.monitor.retries; $i++) {             
             try {
-                if($this.cxVersion.StartsWith("9.3")){
-                    $resp = Invoke-WebRequest -UseBasicParsing -Uri "${apiUri}/swagger/index.html" -TimeoutSec $script:config.monitor.apiResponseTimeoutSeconds
+                if($this.cxVersion.StartsWith("9.")){		
+                    #The the apiUri has a pattern like "http://engine_FQDN:8089/"
+                    $resp = Invoke-WebRequest -UseBasicParsing -Uri "${apiUri}swagger" -TimeoutSec $script:config.monitor.apiResponseTimeoutSeconds
                     break
                 } else{
                     $resp = Invoke-WebRequest -UseBasicParsing -Uri $apiUri -TimeoutSec $script:config.monitor.apiResponseTimeoutSeconds
@@ -1055,6 +1139,22 @@ Class EngineMonitor {
         return $resp
     }
 
+    # Get Engine System Status, the host mus be able to access the engines API
+    [Object] GetEngineSystemStatus ([string] $name, [string] $engineUri){
+        [Object] $response = $null
+        $apiUrl = [string]::Concat($engineUri,"api/v1/system_information/system_status")       
+        
+        try {
+            $response = $this.cxSastRestClient.invokeEngineAPI($apiUrl, [RESTMethod]::GET, $null, $script:config.monitor.apiResponseTimeoutSeconds)
+        }
+        catch {
+            $response = $_.Exception.Response
+            $this.io.Log("ERROR: Getting system status for engine $name - $apiUrl : [$($_.Exception.Message)]")           
+        }
+
+        return $response
+    }
+    
     # Processes response from CxSAST REST API call
     ProcessResponse ([Object] $apiResp) {
 
@@ -1089,14 +1189,27 @@ Class EngineMonitor {
 
                     # Check if engine is idle
                     if ($engine.status.value -eq "Idle") {
+                        
+                        $engineStatus = $this.GetEngineSystemStatus($engine.name, $engine.uri)                         
+                        $message = [string]::Concat($engineInfo, " Detected Status: ", $engine.status.value, " - Current running Scans: ", $engineStatus.runningScans.Count)
+                        $this.io.LogEvent($message)
 
-                        # Write idle engines JSON
-                        $this.io.WriteJSON([AlertType]::ENGINE_IDLE, $engineDetails)
+                        #Check if there is a scan stuck on the engine                        
+                        if($engineStatus.runningScans.Count -gt 0){   
+                            $message = [string]::Concat($engineInfo, " Detected Status: ", $engine.status.value, " instead of [SCANNING]. Current running Scans: ", $engineStatus.runningScans.Count)
+                            $this.io.LogEvent($message)      
 
-                        # Check if this idle engine could have taken on existing queued scans
-                        $this.CheckQueuedScansForMatch($engine)
+                            $this.alertService.AddAlert([AlertType]::ENGINE_ERROR, $message, $engineInfo)
+                        }
+                        else {                                              
+                            # Write idle engines JSON
+                            $this.io.WriteJSON([AlertType]::ENGINE_IDLE, $engineDetails)
+
+                            # Check if this idle engine could have taken on existing queued scans
+                            $this.CheckQueuedScansForMatch($engine)
+                        }
                     }
-
+ 
                     # Check API call elapsed time
                     [TimeSpan] $threshold = [TimeSpan]::FromSeconds($script:config.monitor.thresholds.engineResponseThresholdSeconds)
                     if ($stopwatch.elapsed.TotalSeconds -gt $script:config.monitor.thresholds.engineResponseThresholdSeconds) {
